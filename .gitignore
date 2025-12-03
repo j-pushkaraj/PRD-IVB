@@ -1,0 +1,26 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env/
+.venv/
+
+# macOS
+.DS_Store
+
+# Data (generated)
+data/auto_labels/
+data/augmented/
+
+# Models (generated)
+models/
+
+# Logs
+logs/
+*.log
+EOF
