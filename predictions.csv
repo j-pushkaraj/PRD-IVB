@@ -1,0 +1,7 @@
+image,pred_label,score
+data\auto_labels\good\102bd9_img8.jpg,good,1.0
+data\auto_labels\good\2dba26_img10.jpg,good,0.9999297857284546
+data\auto_labels\good\32d391_img7.jpeg,good,0.9999740123748779
+data\auto_labels\good\35f91d_img12.jpg,good,0.9999997615814209
+data\auto_labels\good\6be390_img11.jpg,good,1.0
+data\auto_labels\good\7e9b5f_img9.jpeg,good,0.9414347410202026
