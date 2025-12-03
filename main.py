@@ -1,14 +1,11 @@
 import os
-import random
-import shutil
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 from PIL import Image, UnidentifiedImageError
 
 import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import models, transforms, datasets
+from torch import nn
+from torchvision import transforms
 import torch.nn.functional as F
 
 
@@ -18,22 +15,22 @@ import torch.nn.functional as F
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# All jaguar + leopard images (mixed) go here
-MIXED_DIR = os.path.join(DATA_DIR, "golden_run")
+# Put ONLY GOOD (normal) images here
+GOOD_DIR = os.path.join(DATA_DIR, "golden_run")
 
-AUTO_LABEL_DIR = os.path.join(DATA_DIR, "auto_labels")
+# Where to save augmented GOOD images
 AUG_DIR = os.path.join(DATA_DIR, "augmented")
+AUG_GOOD_DIR = os.path.join(AUG_DIR, "good")
 
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "good_bad_jaguars_leopards.pth")
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(AUG_GOOD_DIR, exist_ok=True)
 
-for d in [AUTO_LABEL_DIR, AUG_DIR, MODELS_DIR]:
-    os.makedirs(d, exist_ok=True)
+MODEL_PATH = os.path.join(MODELS_DIR, "one_class_good_detector.pth")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 SEED = 42
-random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
@@ -42,7 +39,8 @@ if torch.cuda.is_available():
 # =========================================================
 # UTILITIES
 # =========================================================
-def load_image(path: str):
+def load_image(path: str) -> Optional[Image.Image]:
+    """Load an image as RGB, or return None if unreadable."""
     try:
         return Image.open(path).convert("RGB")
     except (UnidentifiedImageError, OSError):
@@ -58,462 +56,223 @@ def list_files(folder: str) -> List[str]:
 
 
 # =========================================================
-# STEP 1: Deep feature extractor (MobileNetV3)
+# FEATURE & CLASSIFIER (ResNet50)
 # =========================================================
-def build_feature_extractor():
-    from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    backbone = mobilenet_v3_small(weights=weights)
-    backbone.classifier = nn.Identity()  # drop final classifier -> pure features
-    backbone = backbone.to(DEVICE)
-    backbone.eval()
-
-    tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
-
-    @torch.no_grad()
-    def embed(path: str) -> torch.Tensor | None:
-        img = load_image(path)
-        if img is None:
-            return None
-        x = tf(img).unsqueeze(0).to(DEVICE)
-        feat = backbone(x)  # (1, D)
-        return feat.squeeze(0).cpu()  # (D,)
-
-    return embed
-
-
-def compute_embeddings(image_paths: List[str]) -> torch.Tensor:
+def build_resnet_feature_and_classifier():
     """
-    Returns tensor of shape (N, D) for all images.
-    Skips unreadable images.
+    Build:
+      - feature extractor (ResNet50 without final FC)
+      - classifier (full ResNet50) for semantic labels
     """
-    embed = build_feature_extractor()
-    feats = []
-    valid_paths = []
-    for p in image_paths:
-        f = embed(p)
-        if f is not None:
-            feats.append(f)
-            valid_paths.append(p)
-
-    if not feats:
-        raise RuntimeError("No valid images to embed.")
-    X = torch.stack(feats)  # (N, D)
-    return X, valid_paths
-
-
-# =========================================================
-# STEP 2: Robust Deep Fuzzy K-means (RDFKM-like)
-# =========================================================
-class RDFKM:
-    """
-    Simplified Robust Deep Fuzzy K-means:
-      - Deep features from MobileNetV3
-      - Fuzzy C-means clustering with robust sample weights
-    """
-
-    def __init__(
-        self,
-        n_clusters: int = 2,
-        m: float = 2.0,
-        max_iter: int = 100,
-        tol: float = 1e-4,
-        robust_delta: float = 1.0,
-    ):
-        self.c = n_clusters
-        self.m = m  # fuzzifier
-        self.max_iter = max_iter
-        self.tol = tol
-        self.robust_delta = robust_delta
-
-        self.centers: torch.Tensor | None = None  # (c, D)
-        self.U: torch.Tensor | None = None        # (N, c)
-
-    def _init_centers(self, X: torch.Tensor):
-        # Simple k-means++ style init
-        N, D = X.shape
-        centers = torch.empty((self.c, D), dtype=X.dtype)
-        # pick first center randomly
-        idx0 = torch.randint(0, N, (1,)).item()
-        centers[0] = X[idx0]
-        # pick others far away
-        for k in range(1, self.c):
-            dists = torch.min(torch.cdist(X, centers[:k]), dim=1)[0]
-            probs = dists / dists.sum()
-            idx = torch.multinomial(probs, 1).item()
-            centers[k] = X[idx]
-        self.centers = centers
-
-    def fit(self, X: torch.Tensor):
-        """
-        X: (N, D) feature tensor (CPU).
-        """
-        X = X.clone()
-        N, D = X.shape
-
-        if self.centers is None:
-            self._init_centers(X)
-
-        # Initialize membership matrix U randomly
-        U = torch.rand((N, self.c))
-        U = U / U.sum(dim=1, keepdim=True)
-
-        m = self.m
-        eps = 1e-8
-
-        for it in range(self.max_iter):
-            # --- update centers (robust, with sample weights) ---
-            # distances (N, c)
-            dists = torch.cdist(X, self.centers) + eps
-
-            # membership with exponent m
-            Um = U ** m  # (N, c)
-
-            # robust weights per sample based on closest center
-            min_dist, _ = torch.min(dists, dim=1)  # (N,)
-            w = 1.0 / (1.0 + (min_dist / self.robust_delta) ** 2)  # (N,)
-            w = w.unsqueeze(1)  # (N, 1)
-
-            # weighted Um
-            WUm = w * Um  # (N, c)
-
-            centers_new = torch.empty_like(self.centers)
-            for k in range(self.c):
-                num = (WUm[:, k:k+1] * X).sum(dim=0)
-                den = WUm[:, k].sum() + eps
-                centers_new[k] = num / den
-
-            center_shift = torch.norm(centers_new - self.centers).item()
-            self.centers = centers_new
-
-            # --- update memberships U ---
-            dists = torch.cdist(X, self.centers) + eps  # (N, c)
-            # standard fuzzy c-means membership update
-            # u_ik = 1 / sum_j (d_ik / d_ij)^(2/(m-1))
-            inv_d = dists ** (-2.0 / (m - 1.0))
-            U = inv_d / inv_d.sum(dim=1, keepdim=True)
-
-            if center_shift < self.tol:
-                break
-
-        self.U = U
-
-    def hard_labels(self) -> torch.Tensor:
-        """
-        Returns argmax cluster index per sample (N,)
-        """
-        if self.U is None:
-            raise RuntimeError("RDFKM not fitted yet.")
-        return torch.argmax(self.U, dim=1)
-
-    def memberships(self) -> torch.Tensor:
-        if self.U is None:
-            raise RuntimeError("RDFKM not fitted yet.")
-        return self.U
-
-
-# =========================================================
-# STEP 3: Map clusters to Jaguar (GOOD) / Leopard (BAD)
-# =========================================================
-def build_imagenet_classifier():
     from torchvision.models import resnet50, ResNet50_Weights
 
     weights = ResNet50_Weights.DEFAULT
-    model = resnet50(weights=weights).to(DEVICE)
-    model.eval()
+
+    # Feature extractor
+    feat_model = resnet50(weights=weights)
+    feat_model.fc = nn.Identity()
+    feat_model = feat_model.to(DEVICE)
+    feat_model.eval()
+
+    # Classifier
+    cls_model = resnet50(weights=weights).to(DEVICE)
+    cls_model.eval()
+
     tf = weights.transforms()
     labels = weights.meta["categories"]
 
     @torch.no_grad()
-    def classify(path: str, topk: int = 5):
-        img = load_image(path)
-        if img is None:
-            return None
+    def embed_pil(img: Image.Image) -> torch.Tensor:
         x = tf(img).unsqueeze(0).to(DEVICE)
-        logits = model(x)
+        feat = feat_model(x)
+        return feat.squeeze(0).cpu()
+
+    @torch.no_grad()
+    def classify_pil(img: Image.Image, k: int = 3):
+        x = tf(img).unsqueeze(0).to(DEVICE)
+        logits = cls_model(x)
         probs = F.softmax(logits, dim=1)[0]
-        top_probs, top_idxs = torch.topk(probs, k=topk)
-        return [(labels[idx.item()], top_probs[i].item()) for i, idx in enumerate(top_idxs)]
+        top_probs, top_idxs = torch.topk(probs, k=k)
+        result = []
+        for i, idx in enumerate(top_idxs):
+            label = labels[idx.item()]
+            p = top_probs[i].item()
+            result.append((label, p))
+        return result
 
-    return classify
+    return embed_pil, classify_pil
 
 
-def auto_label_with_rdfkm():
+# =========================================================
+# STEP 1: Embed GOOD images + augmentations
+# =========================================================
+def compute_good_embeddings_and_augment(
+    num_augs_per_image: int = 5,
+) -> Tuple[torch.Tensor, List[str]]:
     """
-    1) Compute deep features for all images in MIXED_DIR
-    2) Run RDFKM (fuzzy clustering) with c=2
-    3) For each cluster, look at high-membership images.
-       Use ResNet50 to determine which cluster is Jaguar vs Leopard.
-    4) Create auto_labels/good (Jaguar) and auto_labels/bad (Leopard)
+    1) Load all GOOD images from GOOD_DIR.
+    2) Embed them with ResNet50.
+    3) Generate augmentations and embed those too.
+    4) Return features and paths.
     """
-    print("=== STEP 1 & 2: RDFKM clustering on deep features ===")
-    all_images = list_files(MIXED_DIR)
-    if not all_images:
+    good_files = list_files(GOOD_DIR)
+    if not good_files:
         raise RuntimeError(
-            f"No images found in {MIXED_DIR}. Put jaguar + leopard images there first."
+            f"No images found in GOOD_DIR={GOOD_DIR}. "
+            "Put ONLY GOOD (normal) images there."
         )
 
-    X, valid_paths = compute_embeddings(all_images)  # (N, D)
-    N = X.shape[0]
-    print(f"Embedded {N} images into deep feature space.")
+    print(f"Found {len(good_files)} GOOD images in {GOOD_DIR}")
 
-    rdfkm = RDFKM(n_clusters=2, m=2.0, max_iter=100, tol=1e-4, robust_delta=1.0)
-    rdfkm.fit(X)
-    U = rdfkm.memberships()  # (N, 2)
-    hard = rdfkm.hard_labels()  # (N,)
+    # Clear old augmentations
+    for f in list_files(AUG_GOOD_DIR):
+        os.remove(f)
 
-    # Decide mapping of cluster -> (Jaguar/Leopard) via ResNet
-    classify = build_imagenet_classifier()
+    embed_pil, _ = build_resnet_feature_and_classifier()
 
-    cluster_info = {}
-    for k in range(2):
-        cluster_info[k] = {"jaguar_votes": 0, "leopard_votes": 0, "samples": []}
-
-    # Use only images with membership > 0.6 as "confident" examples
-    for idx, path in enumerate(valid_paths):
-        k = hard[idx].item()
-        conf = U[idx, k].item()
-        if conf < 0.6:
-            continue
-        preds = classify(path, topk=5)
-        if preds is None:
-            continue
-        # vote based on keywords in top-5
-        jag_vote = 0
-        leo_vote = 0
-        for label, prob in preds:
-            ll = label.lower()
-            if "jaguar" in ll:
-                jag_vote += prob
-            if "leopard" in ll:
-                leo_vote += prob
-        cluster_info[k]["jaguar_votes"] += jag_vote
-        cluster_info[k]["leopard_votes"] += leo_vote
-        cluster_info[k]["samples"].append(path)
-
-    print("\nCluster semantic votes (from ResNet50):")
-    for k, info in cluster_info.items():
-        print(
-            f"Cluster {k}: jaguar_votes={info['jaguar_votes']:.3f}, "
-            f"leopard_votes={info['leopard_votes']:.3f}, "
-            f"samples={len(info['samples'])}"
-        )
-
-    # Decide GOOD/BAD mapping
-    # Cluster with higher jaguar_votes -> GOOD, the other -> BAD
-    jag_scores = {
-        k: info["jaguar_votes"] for k, info in cluster_info.items()
-    }
-    good_cluster = max(jag_scores, key=jag_scores.get)
-    bad_cluster = 1 - good_cluster
-
-    print(f"\nGOOD cluster (Jaguar) = {good_cluster}, BAD cluster (Leopard) = {bad_cluster}")
-
-    # Create auto_labels folders
-    GOOD_DIR = os.path.join(AUTO_LABEL_DIR, "good")
-    BAD_DIR = os.path.join(AUTO_LABEL_DIR, "bad")
-    os.makedirs(GOOD_DIR, exist_ok=True)
-    os.makedirs(BAD_DIR, exist_ok=True)
-
-    # Clear previous auto-labels
-    for folder in [GOOD_DIR, BAD_DIR]:
-        for f in list_files(folder):
-            os.remove(f)
-
-    # Assign images based on hard labels + cluster mapping
-    print("\nAssigning images to GOOD/BAD using RDFKM clusters:")
-    for idx, path in enumerate(valid_paths):
-        k = hard[idx].item()
-        fname = os.path.basename(path)
-        if k == good_cluster:
-            dst = os.path.join(GOOD_DIR, fname)
-            label_str = "GOOD"
-        else:
-            dst = os.path.join(BAD_DIR, fname)
-            label_str = "BAD"
-        shutil.copy(path, dst)
-        print(f"{fname:20s} -> {label_str} (cluster={k}, conf={U[idx, k].item():.3f})")
-
-    print("\nGOOD_DIR contents:", os.listdir(GOOD_DIR))
-    print("BAD_DIR contents:", os.listdir(BAD_DIR))
-
-    if len(os.listdir(GOOD_DIR)) == 0:
-        raise RuntimeError("No GOOD images after RDFKM labeling.")
-    if len(os.listdir(BAD_DIR)) == 0:
-        raise RuntimeError("No BAD images after RDFKM labeling.")
-
-    print("=== RDFKM-based auto-labeling DONE ===\n")
-
-
-# =========================================================
-# STEP 4: Augment GOOD/BAD classes
-# =========================================================
-def augment_classes(target_count: int = 15):
-    print(f"=== STEP 3: Augment GOOD/BAD to {target_count} images per class ===")
-    GOOD_SRC = os.path.join(AUTO_LABEL_DIR, "good")
-    BAD_SRC = os.path.join(AUTO_LABEL_DIR, "bad")
-
-    AUG_GOOD_DIR = os.path.join(AUG_DIR, "good")
-    AUG_BAD_DIR = os.path.join(AUG_DIR, "bad")
-    os.makedirs(AUG_GOOD_DIR, exist_ok=True)
-    os.makedirs(AUG_BAD_DIR, exist_ok=True)
-
-    # Clear previous augmented data
-    for folder in [AUG_GOOD_DIR, AUG_BAD_DIR]:
-        for f in list_files(folder):
-            os.remove(f)
-
-    augment = transforms.Compose([
+    # Augmentation pipeline
+    aug_tf = transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.RandomHorizontalFlip(p=0.2),
+        transforms.RandomHorizontalFlip(p=0.3),
     ])
 
-    def generate_for_class(src_dir: str, out_dir: str, prefix: str):
-        files = list_files(src_dir)
-        if not files:
-            print("No files in", src_dir)
-            return
+    feats = []
+    all_paths = []
 
-        count = 0
-        # copy originals
-        for path in files:
-            img = load_image(path)
-            if img is None:
-                continue
-            img.save(os.path.join(out_dir, f"{prefix}_orig_{count}.jpg"))
-            count += 1
+    # 1) originals
+    for p in good_files:
+        img = load_image(p)
+        if img is None:
+            print("Skipping unreadable image:", p)
+            continue
+        feat = embed_pil(img)
+        feats.append(feat)
+        all_paths.append(p)
 
-        # augment until target_count
-        while count < target_count:
-            src = random.choice(files)
-            img = load_image(src)
-            if img is None:
-                continue
-            aug_img = augment(img)
-            aug_img.save(os.path.join(out_dir, f"{prefix}_aug_{count}.jpg"))
-            count += 1
+    print(f"Embedded {len(all_paths)} ORIGINAL good images.")
 
-        print(f"{out_dir}: {count} images")
+    # 2) augmentations
+    aug_count = 0
+    for p in good_files:
+        img = load_image(p)
+        if img is None:
+            continue
 
-    generate_for_class(GOOD_SRC, AUG_GOOD_DIR, prefix="good")
-    generate_for_class(BAD_SRC, AUG_BAD_DIR, prefix="bad")
-    print("=== STEP 3 DONE ===\n")
+        for i in range(num_augs_per_image):
+            aug_img = aug_tf(img)
+
+            # Save augmented
+            base = os.path.splitext(os.path.basename(p))[0]
+            aug_name = f"{base}_aug_{i}.jpg"
+            aug_path = os.path.join(AUG_GOOD_DIR, aug_name)
+            aug_img.save(aug_path)
+
+            # Embed augmented
+            feat = embed_pil(aug_img)
+            feats.append(feat)
+            all_paths.append(aug_path)
+            aug_count += 1
+
+    print(f"Generated and embedded {aug_count} AUGMENTED good images.")
+    X = torch.stack(feats)  # (N, D)
+    print(f"Total GOOD feature vectors (orig + aug): {X.shape[0]} | Dim: {X.shape[1]}")
+    return X, all_paths
 
 
 # =========================================================
-# STEP 5: Train GOOD vs BAD classifier
+# STEP 2: Learn semantic labels of GOOD images
 # =========================================================
-def train_classifier(epochs: int = 10, val_ratio: float = 0.2):
-    print("=== STEP 4: Train GOOD/BAD classifier (jaguar vs leopard) ===")
+def learn_good_semantic_labels(top_k_each: int = 3, max_good_labels: int = 5):
+    """
+    Run ResNet50 classifier on ORIGINAL GOOD images and
+    collect which ImageNet labels are typical for GOOD.
 
-    from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+    Returns:
+      good_labels: List[str] of most frequent semantic labels for GOOD.
+    """
+    print("Learning semantic labels for GOOD images...")
+    good_files = list_files(GOOD_DIR)
+    if not good_files:
+        raise RuntimeError("GOOD_DIR is empty while learning semantics.")
 
-    train_tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    _, classify_pil = build_resnet_feature_and_classifier()
 
-    dataset = datasets.ImageFolder(AUG_DIR, transform=train_tf)
-    if len(dataset) < 2:
-        raise RuntimeError("Not enough images in augmented dataset to train.")
+    label_counts: Dict[str, float] = {}
 
-    class_names = dataset.classes  # ['bad', 'good']
-    print("Classes:", class_names)
+    for p in good_files:
+        img = load_image(p)
+        if img is None:
+            continue
+        preds = classify_pil(img, k=top_k_each)
+        for label, prob in preds:
+            label_counts[label] = label_counts.get(label, 0.0) + prob
 
-    # Train/val split
-    val_size = max(1, int(len(dataset) * val_ratio))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(SEED),
+    # Sort labels by total score (frequency * probability-ish)
+    sorted_labels = sorted(
+        label_counts.items(),
+        key=lambda kv: kv[1],
+        reverse=True,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+    good_labels = [lbl for lbl, _ in sorted_labels[:max_good_labels]]
 
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
-    in_features = model.classifier[3].in_features
-    model.classifier[3] = nn.Linear(in_features, len(class_names))
-    model = model.to(DEVICE)
+    print("GOOD semantic labels (from CNN):")
+    for lbl, score in sorted_labels[:max_good_labels]:
+        print(f"  {lbl} (score={score:.3f})")
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-    def evaluate(loader: DataLoader) -> float:
-        model.eval()
-        correct, total = 0, 0
-        with torch.no_grad():
-            for images, labels in loader:
-                images = images.to(DEVICE)
-                labels = labels.to(DEVICE)
-                outputs = model(images)
-                preds = outputs.argmax(1)
-                total += labels.size(0)
-                correct += (preds == labels).sum().item()
-        return correct / total if total > 0 else 0.0
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        for images, labels in train_loader:
-            images = images.to(DEVICE)
-            labels = labels.to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * images.size(0)
-            preds = outputs.argmax(1)
-            total += labels.size(0)
-            correct += (preds == labels).sum().item()
-
-        train_loss = total_loss / total if total > 0 else 0.0
-        train_acc = correct / total if total > 0 else 0.0
-        val_acc = evaluate(val_loader)
-
-        print(
-            f"Epoch {epoch+1}/{epochs}  "
-            f"TrainLoss={train_loss:.4f}  TrainAcc={train_acc:.3f}  ValAcc={val_acc:.3f}"
-        )
-
-    torch.save(
-        {"model_state": model.state_dict(), "class_names": class_names},
-        MODEL_PATH,
-    )
-
-    print("Model saved to:", MODEL_PATH)
-    print("=== STEP 4 DONE ===\n")
+    return good_labels
 
 
 # =========================================================
-# MAIN PIPELINE
+# STEP 3: Fit one-class anomaly model
 # =========================================================
+def fit_one_class_model():
+    """
+    Fit a robust one-class model on GOOD features and semantics.
+    """
+    # 1) Numeric pattern (features + distances)
+    X, paths = compute_good_embeddings_and_augment(num_augs_per_image=5)  # (N, D)
+
+    center = X.mean(dim=0)  # (D,)
+    dists = torch.norm(X - center.unsqueeze(0), dim=1)  # (N,)
+
+    median_dist = dists.median()
+    abs_dev = torch.abs(dists - median_dist)
+    mad = abs_dev.median()
+    if mad.item() < 1e-6:
+        mad = torch.tensor(1e-3)
+
+    k = 2.5  # stricter than 3.0 since we also have semantics now
+    threshold = median_dist + k * mad
+
+    print("\n=== ONE-CLASS MODEL STATS (NUMERIC) ===")
+    print(f"Num GOOD samples (orig + aug): {len(paths)}")
+    print(f"Median distance               : {median_dist.item():.4f}")
+    print(f"MAD (robust spread)           : {mad.item():.4f}")
+    print(f"k (scale)                     : {k}")
+    print(f"Threshold                     : {threshold.item():.4f}")
+
+    # 2) Semantic pattern (ImageNet labels)
+    good_labels = learn_good_semantic_labels()
+    print("========================================\n")
+
+    state = {
+        "center": center,
+        "median_dist": median_dist,
+        "mad_dist": mad,
+        "threshold": threshold,
+        "k": k,
+        "backbone": "resnet50",
+        "good_labels": good_labels,  # <- NEW: semantic GOOD labels
+    }
+
+    torch.save(state, MODEL_PATH)
+    print(f"✅ One-class GOOD model saved to: {MODEL_PATH}")
+
+
 def main():
-    # 1 & 2) RDFKM clustering + semantic mapping to GOOD/BAD
-    auto_label_with_rdfkm()
-
-    # 3) Data augmentation
-    augment_classes(target_count=15)
-
-    # 4) Train GOOD vs BAD classifier
-    train_classifier(epochs=10, val_ratio=0.2)
+    fit_one_class_model()
 
 
 if __name__ == "__main__":

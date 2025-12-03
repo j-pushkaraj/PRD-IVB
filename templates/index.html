@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950">
+<head>
+  <meta charset="UTF-8" />
+  <title>Visual Anomaly Detector | PRD-IVB</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="h-full text-slate-100">
+  <div class="min-h-full flex flex-col">
+
+    <!-- Top Nav -->
+    <header class="border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+      <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="h-9 w-9 rounded-xl bg-emerald-500/15 border border-emerald-400/40 flex items-center justify-center">
+            <span class="text-emerald-300 font-semibold text-lg">AI</span>
+          </div>
+          <div>
+            <div class="text-sm font-semibold tracking-wide text-slate-100">
+              PRD-IVB · Visual Anomaly Detector
+            </div>
+            <div class="text-xs text-slate-400">
+              One-class GOOD model · Deep CNN + semantics
+            </div>
+          </div>
+        </div>
+
+        <div class="hidden sm:flex items-center gap-2 text-xs">
+          <span class="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 border border-emerald-500/40 px-2 py-1 text-emerald-300">
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            Model ready
+          </span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1">
+      <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="grid gap-6 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] items-start">
+
+          <!-- LEFT COLUMN: Upload + Notes -->
+          <section class="space-y-4">
+            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl shadow-2xl shadow-slate-950/80 p-6">
+              <div class="mb-4 flex flex-col gap-1">
+                <h1 class="text-xl sm:text-2xl font-semibold tracking-tight text-slate-50">
+                  Run visual inspection
+                </h1>
+                <p class="text-xs sm:text-sm text-slate-400">
+                  Upload an image from your manufacturing line. 
+                  The model was trained only on <span class="text-emerald-300 font-semibold">GOOD</span> images
+                  and classifies inputs as <span class="text-emerald-300 font-semibold">GOOD</span> or 
+                  <span class="text-rose-300 font-semibold">NOT_GOOD</span> based on deep features and CNN semantics.
+                </p>
+              </div>
+
+              <form
+                method="POST"
+                enctype="multipart/form-data"
+                class="space-y-4"
+              >
+                <!-- Upload area -->
+                <div>
+                  <label
+                    for="image"
+                    class="block text-xs font-medium text-slate-300 mb-2"
+                  >
+                    Image input
+                  </label>
+                  <div
+                    class="border border-dashed border-slate-700 rounded-2xl p-5 flex flex-col items-center justify-center gap-3 bg-slate-950/70 hover:border-emerald-400/70 transition"
+                  >
+                    <svg
+                      class="h-10 w-10 text-slate-500"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-9-9v9m0-9L7.5 9.75M12 7.5l4.5 2.25"
+                      />
+                    </svg>
+                    <p class="text-xs sm:text-sm text-slate-400 text-center">
+                      Drag & drop an image here, or click to select from your device.
+                    </p>
+                    <input
+                      id="image"
+                      name="image"
+                      type="file"
+                      accept="image/*"
+                      class="mt-2 block text-xs text-slate-200
+                             file:mr-4 file:py-2 file:px-4
+                             file:rounded-full file:border-0
+                             file:text-xs file:font-semibold
+                             file:bg-emerald-500/80 file:text-slate-950
+                             hover:file:bg-emerald-400/90 cursor-pointer"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div class="flex items-center justify-between flex-wrap gap-2">
+                  <div class="text-[11px] text-slate-500">
+                    Tip: Golden run = your reference GOOD samples (e.g. one product variant).
+                  </div>
+                  <button
+                    type="submit"
+                    class="inline-flex items-center justify-center gap-2 px-5 py-2.5
+                           rounded-full bg-emerald-500 text-slate-950 text-sm font-semibold
+                           hover:bg-emerald-400 focus:outline-none focus:ring-2
+                           focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-900
+                           transition"
+                  >
+                    <span class="h-1.5 w-1.5 rounded-full bg-emerald-900 shadow shadow-emerald-200"></span>
+                    <span>Run inspection</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            <!-- Small info card -->
+            <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 text-xs text-slate-400 space-y-1">
+              <div class="font-semibold text-slate-200 text-xs">
+                How the decision is made
+              </div>
+              <ul class="list-disc list-inside space-y-1">
+                <li>Deep ResNet50 features define a <span class="text-emerald-300">GOOD cluster</span> in feature space.</li>
+                <li>A robust distance (median + MAD) defines the anomaly threshold.</li>
+                <li>CNN top labels must match the learned GOOD semantics (e.g. “elephant”, specific machine type).</li>
+              </ul>
+            </div>
+          </section>
+
+          <!-- RIGHT COLUMN: Results -->
+          <section class="space-y-4">
+            <!-- Preview of last uploaded image -->
+            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5">
+              <div class="flex items-center justify-between mb-2">
+                <h2 class="text-sm font-semibold text-slate-200 tracking-wide">
+                  Last inspected image
+                </h2>
+                <span class="text-[11px] text-slate-500">
+                  Input preview
+                </span>
+              </div>
+              {% if uploaded_image %}
+                <div class="aspect-video w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/70 flex items-center justify-center">
+                  <img
+                    src="{{ uploaded_image }}"
+                    alt="Uploaded image preview"
+                    class="max-h-64 w-auto object-contain"
+                  />
+                </div>
+              {% else %}
+                <div class="aspect-video w-full overflow-hidden rounded-2xl border border-dashed border-slate-800 bg-slate-950/60 flex items-center justify-center">
+                  <p class="text-xs text-slate-500">
+                    Upload an image to see a preview here.
+                  </p>
+                </div>
+              {% endif %}
+            </div>
+
+            <!-- Prediction -->
+            <div class="bg-slate-900/85 border border-slate-800 rounded-3xl p-5">
+              <div class="flex items-center justify-between mb-2">
+                <h2 class="text-sm font-semibold text-slate-200 tracking-wide">
+                  Prediction
+                </h2>
+                <span class="text-[11px] text-slate-500">
+                  One image at a time
+                </span>
+              </div>
+
+              {% if prediction %}
+                {% if prediction == "GOOD" %}
+                  <div class="flex items-baseline gap-2 mb-1">
+                    <div class="text-2xl font-bold text-emerald-400">
+                      ✅ GOOD
+                    </div>
+                  </div>
+                  <p class="text-xs text-emerald-200/80">
+                    The image is consistent with your GOOD reference distribution.
+                  </p>
+                {% elif prediction == "NOT_GOOD" %}
+                  <div class="flex items-baseline gap-2 mb-1">
+                    <div class="text-2xl font-bold text-rose-400">
+                      ❌ NOT_GOOD
+                    </div>
+                  </div>
+                  <p class="text-xs text-rose-200/80">
+                    The image deviates from the GOOD pattern and is treated as anomalous.
+                  </p>
+                {% elif prediction == "ERROR" %}
+                  <div class="flex items-baseline gap-2 mb-1">
+                    <div class="text-2xl font-bold text-amber-400">
+                      ⚠️ ERROR
+                    </div>
+                  </div>
+                  <p class="text-xs text-amber-200/80">
+                    Something went wrong while processing the image. Check logs.
+                  </p>
+                {% else %}
+                  <div class="text-sm text-slate-400">
+                    {{ prediction }}
+                  </div>
+                {% endif %}
+              {% else %}
+                <p class="text-sm text-slate-500">
+                  No prediction yet. Upload an image and click <span class="font-semibold text-slate-300">Run inspection</span>.
+                </p>
+              {% endif %}
+            </div>
+
+            <!-- Stats -->
+            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5">
+              <div class="flex items-center justify-between mb-2">
+                <h2 class="text-sm font-semibold text-slate-200 tracking-wide">
+                  Model stats
+                </h2>
+                <span class="text-[11px] text-slate-500">
+                  Distances & thresholds
+                </span>
+              </div>
+              <div class="bg-slate-950/80 rounded-2xl border border-slate-800 px-3 py-3">
+                <pre class="text-[11px] text-slate-200 whitespace-pre-wrap leading-relaxed">
+{{ stats or "Stats will appear here after prediction.\n\nYou will see:\n• Distance to GOOD center\n• Anomaly score (in MAD units)\n• Which checks passed (distance / semantic)." }}
+                </pre>
+              </div>
+            </div>
+
+            <!-- Explanation -->
+            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5">
+              <div class="flex items-center justify-between mb-2">
+                <h2 class="text-sm font-semibold text-slate-200 tracking-wide">
+                  CNN explanation
+                </h2>
+                <span class="text-[11px] text-slate-500">
+                  High-level interpretation
+                </span>
+              </div>
+              <div class="bg-slate-950/80 rounded-2xl border border-slate-800 px-3 py-3">
+                <pre class="text-[11px] text-slate-200 whitespace-pre-wrap leading-relaxed">
+{{ reason or "The explanation will describe why an image was classified as GOOD or NOT_GOOD.\n\nFor anomalies, you will see the top-3 semantic labels from the CNN (e.g. 'rhinoceros', 'broken_machine'), which helps justify the decision." }}
+                </pre>
+              </div>
+            </div>
+          </section>
+
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

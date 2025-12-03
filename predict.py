@@ -1,82 +1,146 @@
 import os
-import sys
-
-from PIL import Image, UnidentifiedImageError
+from typing import List, Tuple
 
 import torch
+from torch import nn
 import torch.nn.functional as F
-from torchvision import models, transforms
+
+from PIL import Image
+import gradio as gr
 
 
+# =========================================================
+# PATHS & DEVICE
+# =========================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "good_bad_jaguars_leopards.pth")
-
+MODEL_PATH = os.path.join(BASE_DIR, "models", "one_class_good_detector.pth")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_image(path: str):
-    try:
-        return Image.open(path).convert("RGB")
-    except (UnidentifiedImageError, OSError):
-        return None
+# =========================================================
+# LOAD ONE-CLASS MODEL
+# =========================================================
+def load_one_class_model():
+    state = torch.load(MODEL_PATH, map_location="cpu")
+    center = state["center"]
+    thresh = float(state["threshold"])
+    median = float(state["median_dist"])
+    mad = float(state["mad_dist"])
+    k = state.get("k", 2.5)
+    good_labels = state.get("good_labels", [])
+    return center, thresh, median, mad, k, good_labels
 
 
-def load_model():
-    from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+# =========================================================
+# RESNET FEATURE + SEMANTIC MODEL
+# =========================================================
+def build_models():
+    from torchvision.models import resnet50, ResNet50_Weights
 
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    class_names = checkpoint["class_names"]
+    weights = ResNet50_Weights.DEFAULT
 
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
-    in_features = model.classifier[3].in_features
-    model.classifier[3] = torch.nn.Linear(in_features, len(class_names))
-    model.load_state_dict(checkpoint["model_state"])
-    model = model.to(DEVICE)
-    model.eval()
+    feat_model = resnet50(weights=weights)
+    feat_model.fc = nn.Identity()
+    feat_model.eval().to(DEVICE)
 
-    return model, class_names
+    cls_model = resnet50(weights=weights)
+    cls_model.eval().to(DEVICE)
+
+    tf = weights.transforms()
+    labels = weights.meta["categories"]
+
+    return feat_model, cls_model, tf, labels
 
 
-def predict_image(img_path: str):
-    model, class_names = load_model()
+CENTER, THRESH, MEDIAN, MAD, K, GOOD_LABELS = load_one_class_model()
+FEAT_MODEL, CLS_MODEL, TF, LABELS = build_models()
 
-    tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
 
-    img = load_image(img_path)
-    if img is None:
-        print("Could not open image:", img_path)
-        return
+# =========================================================
+# PREDICTION LOGIC
+# =========================================================
+@torch.no_grad()
+def predict_image(img: Image.Image) -> Tuple[str, str, str]:
+    img = img.convert("RGB")
 
-    x = tf(img).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        logits = model(x)
-        probs = F.softmax(logits, dim=1)[0]
+    x = TF(img).unsqueeze(0).to(DEVICE)
 
-    print("Classes:", class_names)
-    for i, cls in enumerate(class_names):
-        print(f"{cls}: {probs[i].item():.3f}")
+    # 1) Distance-based anomaly score
+    feat = FEAT_MODEL(x)
+    dist = torch.norm(feat.cpu() - CENTER).item()
+    anomaly_score = (dist - MEDIAN) / max(MAD, 1e-3)
 
-    pred_idx = probs.argmax().item()
-    print("PREDICTION:", class_names[pred_idx].upper())
+    # 2) Semantic labels from CNN
+    logits = CLS_MODEL(x)
+    probs = F.softmax(logits, dim=1)[0]
+    top_probs, top_idxs = torch.topk(probs, 3)
 
+    raw_labels = [LABELS[idx.item()] for idx in top_idxs]
+    probs_vals = [top_probs[i].item() for i in range(len(top_probs))]
+
+    reasons = [f"{lbl} ({p:.2f})" for lbl, p in zip(raw_labels, probs_vals)]
+
+    # Semantic GOOD check
+    MIN_GOOD_LABEL_PROB = 0.30
+    if GOOD_LABELS:
+        sem_good = any(
+            (lbl in GOOD_LABELS) and (p >= MIN_GOOD_LABEL_PROB)
+            for lbl, p in zip(raw_labels, probs_vals)
+        )
+    else:
+        sem_good = True  # fallback
+
+    # Distance GOOD check
+    dist_good = dist <= THRESH
+
+    # Final hybrid decision
+    is_good = dist_good and sem_good
+
+    stats_text = (
+        f"Distance: {dist:.3f}\n"
+        f"Threshold: {THRESH:.3f}\n"
+        f"Anomaly score: {anomaly_score:.2f}\n"
+        f"Distance-OK: {dist_good}\n"
+        f"Semantic-OK: {sem_good}\n"
+        f"GOOD labels (train): {', '.join(GOOD_LABELS) if GOOD_LABELS else 'N/A'}"
+    )
+
+    if is_good:
+        reason_text = (
+            "✅ Image matches the learned GOOD pattern.\n\n"
+            "CNN top labels:\n - " + "\n - ".join(reasons)
+        )
+        return "✅ GOOD", stats_text, reason_text
+
+    # NOT GOOD
+    reason_text = (
+        "❌ Image deviates from the GOOD pattern.\n\n"
+        "Either it's too far in feature space, or its semantic class\n"
+        "does not match the GOOD reference class.\n\n"
+        "CNN believes it resembles:\n - " + "\n - ".join(reasons)
+    )
+
+    return "❌ NOT_GOOD", stats_text, reason_text
+
+
+# =========================================================
+# GRADIO UI (compatible with older versions)
+# =========================================================
+demo = gr.Interface(
+    fn=predict_image,
+    inputs=gr.Image(type="pil", label="Upload Image"),
+    outputs=[
+        gr.Textbox(label="Prediction"),
+        gr.Textbox(label="Stats"),
+        gr.Textbox(label="Reason (CNN explanation)"),
+    ],
+    title="Visual Anomaly Detector for Manufacturing",
+    description=(
+        "Upload an image.\n"
+        "Model was trained ONLY on GOOD images and uses a hybrid of\n"
+        "deep features + CNN semantics to decide if it's GOOD or NOT_GOOD."
+    ),
+)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python predict.py path/to/image.jpg")
-        sys.exit(1)
-
-    img_path = sys.argv[1]
-    if not os.path.isfile(img_path):
-        print("File not found:", img_path)
-        sys.exit(1)
-
-    predict_image(img_path)
+    demo.launch()
